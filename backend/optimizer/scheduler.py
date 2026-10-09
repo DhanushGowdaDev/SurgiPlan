@@ -12,8 +12,14 @@ PRIORITY_WEIGHT = {
 }
 
 
-def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
-    """Optimize surgeries with room, staff and equipment constraints."""
+def optimize_schedule(
+    surgeries,
+    operating_rooms,
+    equipment,
+    staff=None,
+    recovery_beds=None,
+):
+    """Optimize surgeries with room, staff, equipment and recovery constraints."""
 
     model = cp_model.CpModel()
     horizon = 600  # 08:00 to 18:00
@@ -27,6 +33,8 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
     intervals_by_surgeon = defaultdict(list)
     intervals_by_anesthetist = defaultdict(list)
     intervals_by_equipment_type = defaultdict(list)
+    recovery_intervals = []
+    recovery_demands = []
 
     equipment_capacity = defaultdict(int)
     for item in equipment:
@@ -36,8 +44,36 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
         member.id: member for member in (staff or [])
     }
 
+    recovery_capacity = None
+    if recovery_beds is not None:
+        recovery_capacity = sum(
+            1 for bed in recovery_beds if bed.available
+        )
+
+    max_recovery_duration = max(
+        (s.recovery_duration for s in surgeries),
+        default=0,
+    )
+    recovery_horizon = horizon + max_recovery_duration
+
+    # Create scheduling variables.
     for surgery in surgeries:
         surgery_id = surgery.id
+
+        if surgery.duration <= 0:
+            raise ValueError(
+                f"Surgery {surgery_id} must have a positive duration."
+            )
+
+        if surgery.recovery_duration <= 0:
+            raise ValueError(
+                f"Surgery {surgery_id} must have a positive recovery duration."
+            )
+
+        if surgery.recovery_beds < 0:
+            raise ValueError(
+                f"Surgery {surgery_id} cannot require negative recovery beds."
+            )
 
         scheduled = model.NewBoolVar(f"scheduled_{surgery_id}")
         start = model.NewIntVar(0, horizon, f"start_{surgery_id}")
@@ -55,7 +91,7 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
             start + surgery.duration <= horizon
         ).OnlyEnforceIf(scheduled)
 
-        # Check surgeon and anesthetist working hours.
+        # Surgeon and anesthetist availability.
         if staff is not None:
             required_staff = [
                 (surgery.surgeon, "surgeon"),
@@ -69,6 +105,14 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
                     model.Add(scheduled == 0)
                     continue
 
+                if not (
+                    0 <= member.available_start
+                    < member.available_end <= horizon
+                ):
+                    raise ValueError(
+                        f"Invalid working hours for {staff_id}."
+                    )
+
                 model.Add(
                     start >= member.available_start
                 ).OnlyEnforceIf(scheduled)
@@ -77,7 +121,7 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
                     end <= member.available_end
                 ).OnlyEnforceIf(scheduled)
 
-        # Assign each scheduled surgery to one compatible room.
+        # Assign each scheduled surgery to exactly one compatible OR.
         assignments = []
 
         for room_index, room in enumerate(operating_rooms):
@@ -90,6 +134,14 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
             assignments.append(assignment)
             room_assignment_vars[(surgery_id, room_index)] = assignment
 
+            if not (
+                0 <= room.available_start
+                < room.available_end <= horizon
+            ):
+                raise ValueError(
+                    f"Invalid working hours for {room.id}."
+                )
+
             model.Add(
                 start >= room.available_start
             ).OnlyEnforceIf(assignment)
@@ -98,14 +150,14 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
                 end <= room.available_end
             ).OnlyEnforceIf(assignment)
 
-            interval = model.NewOptionalIntervalVar(
+            room_interval = model.NewOptionalIntervalVar(
                 start,
                 surgery.duration,
                 end,
                 assignment,
                 f"room_{surgery_id}_{room.id}",
             )
-            intervals_by_room[room_index].append(interval)
+            intervals_by_room[room_index].append(room_interval)
 
         model.Add(sum(assignments) == scheduled)
 
@@ -147,14 +199,36 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
                 equipment_interval
             )
 
-    # Add fixed maintenance intervals to each operating room.
+        # Recovery starts when the surgery finishes.
+        # Each surgery occupies its requested number of beds
+        # for its recovery duration.
+        if recovery_capacity is not None:
+            recovery_end = model.NewIntVar(
+                0,
+                recovery_horizon,
+                f"recovery_end_{surgery_id}",
+            )
+
+            recovery_interval = model.NewOptionalIntervalVar(
+                end,
+                surgery.recovery_duration,
+                recovery_end,
+                scheduled,
+                f"recovery_{surgery_id}",
+            )
+
+            recovery_intervals.append(recovery_interval)
+            recovery_demands.append(surgery.recovery_beds)
+
+    # Add room maintenance intervals.
     for room_index, room in enumerate(operating_rooms):
         for period_index, period in enumerate(room.unavailable_periods):
             maintenance_start = period["start"]
             maintenance_end = period["end"]
 
             if not (
-                0 <= maintenance_start < maintenance_end <= horizon
+                room.available_start <= maintenance_start
+                < maintenance_end <= room.available_end
             ):
                 raise ValueError(
                     f"Invalid maintenance period for {room.id}: {period}"
@@ -168,7 +242,7 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
             )
             intervals_by_room[room_index].append(maintenance_interval)
 
-    # No overlapping room use, including maintenance.
+    # Operating-room, maintenance and staff conflict constraints.
     for intervals in intervals_by_room.values():
         model.AddNoOverlap(intervals)
 
@@ -178,7 +252,7 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
     for intervals in intervals_by_anesthetist.values():
         model.AddNoOverlap(intervals)
 
-    # Allow concurrent equipment use up to physical capacity.
+    # Limit simultaneous use of each equipment type.
     for equipment_type, intervals in intervals_by_equipment_type.items():
         model.AddCumulative(
             intervals,
@@ -186,7 +260,15 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
             equipment_capacity[equipment_type],
         )
 
-    # Maximize priority-weighted scheduled surgeries and favor earlier starts.
+    # Limit simultaneous recovery demand to available beds.
+    if recovery_capacity is not None and recovery_intervals:
+        model.AddCumulative(
+            recovery_intervals,
+            recovery_demands,
+            recovery_capacity,
+        )
+
+    # Maximize priority-weighted scheduling and favor earlier starts.
     objective_terms = []
 
     for surgery in surgeries:
@@ -212,6 +294,7 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
 
     model.Maximize(sum(objective_terms))
 
+    # Solve the optimization model.
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 10
     solver.parameters.num_search_workers = 8
@@ -257,6 +340,10 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
                 "start": start,
                 "end": end,
                 "duration": surgery.duration,
+                "recovery_start": end,
+                "recovery_end": end + surgery.recovery_duration,
+                "recovery_duration": surgery.recovery_duration,
+                "recovery_beds": surgery.recovery_beds,
                 "required_equipment": list(
                     surgery.required_equipment
                 ),
@@ -270,4 +357,5 @@ def optimize_schedule(surgeries, operating_rooms, equipment, staff=None):
         "schedule": schedule,
         "unscheduled_surgeries": unscheduled_surgeries,
         "status": solver.StatusName(status),
+        "recovery_bed_capacity": recovery_capacity,
     }

@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass, field
 from typing import List
 
@@ -13,6 +14,7 @@ class Surgery:
     anesthetist: str
     required_equipment: List[str] = field(default_factory=list)
     recovery_beds: int = 1
+    recovery_duration: int = 60
     preferred_start: int = 0
     preferred_end: int = 600
 

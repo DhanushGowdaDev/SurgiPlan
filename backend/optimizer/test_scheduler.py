@@ -3,56 +3,48 @@ from data.demo_data import create_demo_data
 from optimizer.scheduler import optimize_schedule
 
 
-def main():
-    data = create_demo_data()
+def validate_recovery_capacity(schedule, capacity):
+    events = []
 
-    surgeries = data["surgeries"]
-    operating_rooms = data["operating_rooms"]
-    equipment = data["equipment"]
-    staff = data["staff"]
+    for item in schedule:
+        demand = item["recovery_beds"]
 
-    # Test OR-2 maintenance from 10:00 AM to 12:00 PM.
-    or2 = next(
-        room for room in operating_rooms if room.id == "OR-2"
-    )
-    or2.unavailable_periods = [
-        {"start": 120, "end": 240}
-    ]
+        if demand == 0:
+            continue
 
-    # Test a restricted surgeon shift.
-    # Dr. Patel is available only from minute 60 to minute 300.
-    surgeon = next(
-        member for member in staff if member.id == "Dr. Patel"
-    )
-    surgeon.available_start = 60
-    surgeon.available_end = 300
+        events.append((item["recovery_start"], demand))
+        events.append((item["recovery_end"], -demand))
 
-    result = optimize_schedule(
-        surgeries,
-        operating_rooms,
-        equipment,
-        staff,
-    )
+    # Process recovery endings before starts at the same minute.
+    events.sort(key=lambda event: (event[0], event[1]))
 
-    print("\n==============================")
-    print("SURGIPLAN CONSTRAINT TEST")
-    print("==============================")
-    print("Solver status:", result["status"])
-    print("Scheduled:", len(result["schedule"]))
-    print("Unscheduled:", len(result["unscheduled_surgeries"]))
+    occupied = 0
 
+    for minute, change in events:
+        occupied += change
+
+        assert occupied >= 0, (
+            f"Invalid recovery-bed occupancy at minute {minute}."
+        )
+        assert occupied <= capacity, (
+            f"Recovery capacity exceeded at minute {minute}: "
+            f"{occupied}/{capacity} beds."
+        )
+
+
+def validate_schedule(result, data, capacity):
     assert result["status"] in ("OPTIMAL", "FEASIBLE"), (
-        "The optimizer did not find a valid solution."
+        f"Solver did not find a solution: {result['status']}"
     )
 
     rooms_by_id = {
-        room.id: room for room in operating_rooms
+        room.id: room for room in data["operating_rooms"]
     }
     staff_by_id = {
-        member.id: member for member in staff
+        member.id: member for member in data["staff"]
     }
 
-    # Validate room availability, maintenance and staff working hours.
+    # Check room availability and maintenance.
     for item in result["schedule"]:
         room = rooms_by_id[item["room"]]
         start = item["start"]
@@ -62,30 +54,20 @@ def main():
         assert end <= room.available_end
 
         for period in room.unavailable_periods:
-            overlaps = (
-                start < period["end"]
-                and end > period["start"]
-            )
-            assert not overlaps, (
-                f"{item['surgery_id']} overlaps maintenance "
-                f"in {room.id}."
-            )
+            assert not (
+                start < period["end"] and end > period["start"]
+            ), f"{item['surgery_id']} overlaps room maintenance."
 
+        # Check surgeon and anesthetist working hours.
         for staff_id in (item["surgeon"], item["anesthetist"]):
             member = staff_by_id[staff_id]
 
-            assert start >= member.available_start, (
-                f"{staff_id} is unavailable when "
-                f"{item['surgery_id']} starts."
-            )
-            assert end <= member.available_end, (
-                f"{staff_id} is unavailable when "
-                f"{item['surgery_id']} finishes."
-            )
+            assert start >= member.available_start
+            assert end <= member.available_end
 
-    # Validate that surgeries do not overlap within each OR.
-    for room in operating_rooms:
-        room_schedule = sorted(
+    # Check no overlapping surgeries in each room.
+    for room in data["operating_rooms"]:
+        items = sorted(
             [
                 item for item in result["schedule"]
                 if item["room"] == room.id
@@ -93,22 +75,19 @@ def main():
             key=lambda item: item["start"],
         )
 
-        for previous, current in zip(
-            room_schedule, room_schedule[1:]
-        ):
+        for previous, current in zip(items, items[1:]):
             assert previous["end"] <= current["start"], (
                 f"Overlapping surgeries in {room.id}."
             )
 
-    # Validate that each surgeon and anesthetist has no overlapping cases.
-    for staff_field in ("surgeon", "anesthetist"):
-        staff_schedule = {}
+    # Check no overlapping assignments for each staff member.
+    for field in ("surgeon", "anesthetist"):
+        by_person = {}
 
         for item in result["schedule"]:
-            staff_id = item[staff_field]
-            staff_schedule.setdefault(staff_id, []).append(item)
+            by_person.setdefault(item[field], []).append(item)
 
-        for staff_id, items in staff_schedule.items():
+        for staff_id, items in by_person.items():
             items.sort(key=lambda item: item["start"])
 
             for previous, current in zip(items, items[1:]):
@@ -116,9 +95,79 @@ def main():
                     f"{staff_id} has overlapping surgeries."
                 )
 
-    print("\nAll room, maintenance and staff checks passed.")
+    # Check total recovery-bed occupancy.
+    validate_recovery_capacity(result["schedule"], capacity)
 
-    print("\nSchedule:")
+
+def main():
+    data = create_demo_data()
+
+    # Maintenance in OR-2: 10:00 AM to 12:00 PM.
+    or2 = next(
+        room for room in data["operating_rooms"]
+        if room.id == "OR-2"
+    )
+    or2.unavailable_periods = [
+        {"start": 120, "end": 240}
+    ]
+
+    # Restrict Dr. Patel's working hours for testing.
+    surgeon = next(
+        member for member in data["staff"]
+        if member.id == "Dr. Patel"
+    )
+    surgeon.available_start = 60
+    surgeon.available_end = 300
+
+    # Test the normal capacity of 15 recovery beds.
+    normal_beds = data["recovery_beds"]
+
+    result = optimize_schedule(
+        data["surgeries"],
+        data["operating_rooms"],
+        data["equipment"],
+        data["staff"],
+        normal_beds,
+    )
+
+    normal_capacity = sum(
+        1 for bed in normal_beds if bed.available
+    )
+
+    validate_schedule(result, data, normal_capacity)
+
+    print("\n==============================")
+    print("SURGIPLAN RECOVERY CAPACITY TEST")
+    print("==============================")
+    print("Solver status:", result["status"])
+    print("Recovery capacity:", normal_capacity)
+    print("Scheduled:", len(result["schedule"]))
+    print("Unscheduled:", len(result["unscheduled_surgeries"]))
+    print("15-bed capacity check passed.")
+
+    # Simulate a reduction to three available recovery beds.
+    reduced_beds = normal_beds[:3]
+
+    reduced_result = optimize_schedule(
+        data["surgeries"],
+        data["operating_rooms"],
+        data["equipment"],
+        data["staff"],
+        reduced_beds,
+    )
+
+    reduced_capacity = sum(
+        1 for bed in reduced_beds if bed.available
+    )
+
+    validate_schedule(reduced_result, data, reduced_capacity)
+
+    print("\nReduced recovery capacity:", reduced_capacity)
+    print("Scheduled:", len(reduced_result["schedule"]))
+    print("Unscheduled:", len(reduced_result["unscheduled_surgeries"]))
+    print("3-bed capacity check passed.")
+
+    print("\nSchedule for the 15-bed scenario:")
     for item in sorted(
         result["schedule"],
         key=lambda entry: (entry["room"], entry["start"]),
@@ -126,11 +175,12 @@ def main():
         print(
             f"{item['room']} | {item['surgery_id']} | "
             f"{item['start']}-{item['end']} | "
-            f"{item['priority']} | Surgeon: {item['surgeon']}"
+            f"Recovery: {item['recovery_start']}-"
+            f"{item['recovery_end']} | "
+            f"Beds: {item['recovery_beds']}"
         )
 
-    print("\nUnscheduled surgeries:")
-    print(result["unscheduled_surgeries"])
+    print("\nAll recovery, room and staff checks passed.")
 
 
 if __name__ == "__main__":
