@@ -13,7 +13,7 @@ PRIORITY_WEIGHT = {
 
 
 def optimize_schedule(surgeries, operating_rooms, equipment):
-    """Optimize surgery scheduling using OR-Tools CP-SAT."""
+    """Optimize surgery scheduling with room, staff and equipment constraints."""
 
     model = cp_model.CpModel()
     horizon = 600  # 08:00 to 18:00, in minutes
@@ -28,12 +28,12 @@ def optimize_schedule(surgeries, operating_rooms, equipment):
     intervals_by_anesthetist = defaultdict(list)
     intervals_by_equipment_type = defaultdict(list)
 
-    # Count physical equipment units by type.
+    # Count physical equipment units by equipment type.
     equipment_capacity = defaultdict(int)
     for item in equipment:
         equipment_capacity[item.equipment_type] += 1
 
-    # Create variables for every surgery.
+    # Create decision variables for every surgery.
     for surgery in surgeries:
         surgery_id = surgery.id
 
@@ -45,7 +45,6 @@ def optimize_schedule(surgeries, operating_rooms, equipment):
         start_vars[surgery_id] = start
         end_vars[surgery_id] = end
 
-        # A scheduled surgery must finish within the horizon.
         model.Add(
             end == start + surgery.duration
         ).OnlyEnforceIf(scheduled)
@@ -54,8 +53,7 @@ def optimize_schedule(surgeries, operating_rooms, equipment):
             start + surgery.duration <= horizon
         ).OnlyEnforceIf(scheduled)
 
-        # Operating-room assignment: exactly one compatible OR
-        # if scheduled; zero ORs otherwise.
+        # Assign each scheduled surgery to exactly one compatible room.
         assignments = []
 
         for room_index, room in enumerate(operating_rooms):
@@ -68,6 +66,15 @@ def optimize_schedule(surgeries, operating_rooms, equipment):
             assignments.append(assignment)
             room_assignment_vars[(surgery_id, room_index)] = assignment
 
+            # Room-specific working hours.
+            model.Add(
+                start >= room.available_start
+            ).OnlyEnforceIf(assignment)
+
+            model.Add(
+                end <= room.available_end
+            ).OnlyEnforceIf(assignment)
+
             interval = model.NewOptionalIntervalVar(
                 start,
                 surgery.duration,
@@ -79,7 +86,7 @@ def optimize_schedule(surgeries, operating_rooms, equipment):
 
         model.Add(sum(assignments) == scheduled)
 
-        # Surgeon cannot perform overlapping surgeries.
+        # A surgeon cannot perform overlapping surgeries.
         surgeon_interval = model.NewOptionalIntervalVar(
             start,
             surgery.duration,
@@ -89,7 +96,7 @@ def optimize_schedule(surgeries, operating_rooms, equipment):
         )
         intervals_by_surgeon[surgery.surgeon].append(surgeon_interval)
 
-        # Anesthetist cannot support overlapping surgeries.
+        # An anesthetist cannot support overlapping surgeries.
         anesthetist_interval = model.NewOptionalIntervalVar(
             start,
             surgery.duration,
@@ -101,11 +108,9 @@ def optimize_schedule(surgeries, operating_rooms, equipment):
             anesthetist_interval
         )
 
-        # Each required equipment type consumes one unit
-        # for the entire duration of the surgery.
+        # Each required equipment type uses one unit for the surgery duration.
         for equipment_type in surgery.required_equipment:
             if equipment_capacity[equipment_type] == 0:
-                # Cannot schedule surgery if equipment is missing.
                 model.Add(scheduled == 0)
                 continue
 
@@ -120,18 +125,40 @@ def optimize_schedule(surgeries, operating_rooms, equipment):
                 equipment_interval
             )
 
-    # Resource constraints.
+    # Add fixed maintenance intervals to each room.
+    # AddNoOverlap will prevent surgeries from overlapping maintenance.
+    for room_index, room in enumerate(operating_rooms):
+        for period_index, period in enumerate(room.unavailable_periods):
+            maintenance_start = period["start"]
+            maintenance_end = period["end"]
+
+            if not (
+                0 <= maintenance_start < maintenance_end <= horizon
+            ):
+                raise ValueError(
+                    f"Invalid maintenance period for {room.id}: {period}"
+                )
+
+            maintenance_interval = model.NewIntervalVar(
+                maintenance_start,
+                maintenance_end - maintenance_start,
+                maintenance_end,
+                f"maintenance_{room.id}_{period_index}",
+            )
+            intervals_by_room[room_index].append(maintenance_interval)
+
+    # Enforce room availability, maintenance and no overlapping surgeries.
     for intervals in intervals_by_room.values():
         model.AddNoOverlap(intervals)
 
+    # Enforce staff availability against overlapping assignments.
     for intervals in intervals_by_surgeon.values():
         model.AddNoOverlap(intervals)
 
     for intervals in intervals_by_anesthetist.values():
         model.AddNoOverlap(intervals)
 
-    # Capacity permits as many simultaneous users as there
-    # are physical units of each equipment type.
+    # Enforce the number of physical units available for each equipment type.
     for equipment_type, intervals in intervals_by_equipment_type.items():
         model.AddCumulative(
             intervals,
@@ -139,7 +166,7 @@ def optimize_schedule(surgeries, operating_rooms, equipment):
             equipment_capacity[equipment_type],
         )
 
-    # Objective: prioritize surgeries and prefer earlier starts.
+    # Objective: prioritize important surgeries and prefer earlier starts.
     objective_terms = []
 
     for surgery in surgeries:
@@ -165,13 +192,13 @@ def optimize_schedule(surgeries, operating_rooms, equipment):
 
     model.Maximize(sum(objective_terms))
 
-    # Solve the model.
+    # Solve the optimization model.
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 10
     solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
 
-    # Build the result.
+    # Build the output schedule.
     schedule = []
     unscheduled_surgeries = []
 
