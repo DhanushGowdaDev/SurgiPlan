@@ -1,3 +1,4 @@
+
 from data.demo_data import create_demo_data
 from optimizer.scheduler import optimize_schedule
 
@@ -7,41 +8,56 @@ def main():
 
     surgeries = data["surgeries"]
     operating_rooms = data["operating_rooms"]
+    equipment = data["equipment"]
 
     result = optimize_schedule(
         surgeries,
-        operating_rooms
+        operating_rooms,
+        equipment,
     )
 
-    print("\n==============================")
+    print()
+    print("==============================")
     print("SURGIPLAN OPTIMIZATION RESULT")
-    print("==============================\n")
+    print("==============================")
+    print()
 
     print("Solver status:")
     print(result["status"])
 
-    print("\nScheduled surgeries:")
+    print()
+    print("Scheduled surgeries:")
     print(len(result["schedule"]))
 
-    print("\nUnscheduled surgeries:")
+    print()
+    print("Unscheduled surgeries:")
     print(len(result["unscheduled_surgeries"]))
 
-    print("\nSchedule:\n")
+    print()
+    print("Schedule:")
+    print()
 
     for item in sorted(
         result["schedule"],
-        key=lambda x: (x["room"], x["start"])
+        key=lambda row: (row["room"], row["start"]),
     ):
+        equipment_text = ", ".join(
+            item["required_equipment"]
+        ) or "None"
+
         print(
             f'{item["room"]} | '
             f'{item["surgery_id"]} | '
             f'{item["procedure"]} | '
             f'{item["start"]}-{item["end"]} | '
-            f'{item["priority"]}'
+            f'{item["priority"]} | '
+            f'Equipment: {equipment_text}'
         )
 
-    print("\nUnscheduled:")
+    print()
+    print("Unscheduled:")
     print(result["unscheduled_surgeries"])
+    print()
 
 
 if __name__ == "__main__":

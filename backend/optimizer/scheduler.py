@@ -1,3 +1,4 @@
+
 from collections import defaultdict
 from ortools.sat.python import cp_model
 
@@ -11,25 +12,11 @@ PRIORITY_WEIGHT = {
 }
 
 
-def optimize_schedule(surgeries, operating_rooms):
-    """
-    SurgiPlan OR-Tools scheduling engine.
-
-    Constraints:
-    - Surgery can only use a compatible OR.
-    - A surgery can use only one OR.
-    - Surgeries cannot overlap in the same OR.
-    - A surgeon cannot perform overlapping surgeries.
-    - An anesthetist cannot support overlapping surgeries.
-    - Surgeries must fit inside the scheduling horizon.
-    - Higher-priority surgeries are preferred.
-
-    OR-Tools is the source of truth for scheduling.
-    """
+def optimize_schedule(surgeries, operating_rooms, equipment):
+    """Optimize surgery scheduling using OR-Tools CP-SAT."""
 
     model = cp_model.CpModel()
-
-    horizon = 600  # 08:00 - 18:00
+    horizon = 600  # 08:00 to 18:00, in minutes
 
     scheduled_vars = {}
     start_vars = {}
@@ -39,166 +26,131 @@ def optimize_schedule(surgeries, operating_rooms):
     intervals_by_room = defaultdict(list)
     intervals_by_surgeon = defaultdict(list)
     intervals_by_anesthetist = defaultdict(list)
+    intervals_by_equipment_type = defaultdict(list)
 
-    # ---------------------------------------------------------
-    # Create surgery variables
-    # ---------------------------------------------------------
+    # Count physical equipment units by type.
+    equipment_capacity = defaultdict(int)
+    for item in equipment:
+        equipment_capacity[item.equipment_type] += 1
 
+    # Create variables for every surgery.
     for surgery in surgeries:
-
         surgery_id = surgery.id
 
-        scheduled = model.NewBoolVar(
-            f"scheduled_{surgery_id}"
-        )
-
-        start = model.NewIntVar(
-            0,
-            horizon,
-            f"start_{surgery_id}"
-        )
-
-        end = model.NewIntVar(
-            0,
-            horizon,
-            f"end_{surgery_id}"
-        )
+        scheduled = model.NewBoolVar(f"scheduled_{surgery_id}")
+        start = model.NewIntVar(0, horizon, f"start_{surgery_id}")
+        end = model.NewIntVar(0, horizon, f"end_{surgery_id}")
 
         scheduled_vars[surgery_id] = scheduled
         start_vars[surgery_id] = start
         end_vars[surgery_id] = end
 
-        # End = start + duration
+        # A scheduled surgery must finish within the horizon.
         model.Add(
             end == start + surgery.duration
         ).OnlyEnforceIf(scheduled)
 
-        # Surgery must finish within the working day.
         model.Add(
             start + surgery.duration <= horizon
         ).OnlyEnforceIf(scheduled)
 
+        # Operating-room assignment: exactly one compatible OR
+        # if scheduled; zero ORs otherwise.
         assignments = []
 
-        # -----------------------------------------------------
-        # OR assignment
-        # -----------------------------------------------------
-
         for room_index, room in enumerate(operating_rooms):
-
-            # Only compatible specialties can use this OR.
             if surgery.specialty not in room.specialties:
                 continue
 
             assignment = model.NewBoolVar(
                 f"{surgery_id}_uses_{room.id}"
             )
-
             assignments.append(assignment)
-
-            room_assignment_vars[
-                (surgery_id, room_index)
-            ] = assignment
+            room_assignment_vars[(surgery_id, room_index)] = assignment
 
             interval = model.NewOptionalIntervalVar(
                 start,
                 surgery.duration,
                 end,
                 assignment,
-                f"interval_{surgery_id}_{room.id}"
+                f"room_{surgery_id}_{room.id}",
             )
+            intervals_by_room[room_index].append(interval)
 
-            intervals_by_room[room_index].append(
-                interval
-            )
+        model.Add(sum(assignments) == scheduled)
 
-        # Exactly one compatible OR if scheduled.
-        model.Add(
-            sum(assignments) == scheduled
-        )
-
-        # -----------------------------------------------------
-        # Surgeon resource interval
-        # -----------------------------------------------------
-
+        # Surgeon cannot perform overlapping surgeries.
         surgeon_interval = model.NewOptionalIntervalVar(
             start,
             surgery.duration,
             end,
             scheduled,
-            f"surgeon_{surgery_id}"
+            f"surgeon_{surgery_id}",
         )
+        intervals_by_surgeon[surgery.surgeon].append(surgeon_interval)
 
-        intervals_by_surgeon[
-            surgery.surgeon
-        ].append(surgeon_interval)
-
-        # -----------------------------------------------------
-        # Anesthetist resource interval
-        # -----------------------------------------------------
-
+        # Anesthetist cannot support overlapping surgeries.
         anesthetist_interval = model.NewOptionalIntervalVar(
             start,
             surgery.duration,
             end,
             scheduled,
-            f"anesthetist_{surgery_id}"
+            f"anesthetist_{surgery_id}",
+        )
+        intervals_by_anesthetist[surgery.anesthetist].append(
+            anesthetist_interval
         )
 
-        intervals_by_anesthetist[
-            surgery.anesthetist
-        ].append(anesthetist_interval)
+        # Each required equipment type consumes one unit
+        # for the entire duration of the surgery.
+        for equipment_type in surgery.required_equipment:
+            if equipment_capacity[equipment_type] == 0:
+                # Cannot schedule surgery if equipment is missing.
+                model.Add(scheduled == 0)
+                continue
 
-    # ---------------------------------------------------------
-    # OR overlap constraints
-    # ---------------------------------------------------------
+            equipment_interval = model.NewOptionalIntervalVar(
+                start,
+                surgery.duration,
+                end,
+                scheduled,
+                f"equipment_{equipment_type}_{surgery_id}",
+            )
+            intervals_by_equipment_type[equipment_type].append(
+                equipment_interval
+            )
 
-    for room_index, intervals in intervals_by_room.items():
-
+    # Resource constraints.
+    for intervals in intervals_by_room.values():
         model.AddNoOverlap(intervals)
 
-    # ---------------------------------------------------------
-    # Surgeon overlap constraints
-    # ---------------------------------------------------------
-
-    for surgeon, intervals in intervals_by_surgeon.items():
-
+    for intervals in intervals_by_surgeon.values():
         model.AddNoOverlap(intervals)
 
-    # ---------------------------------------------------------
-    # Anesthetist overlap constraints
-    # ---------------------------------------------------------
-
-    for anesthetist, intervals in intervals_by_anesthetist.items():
-
+    for intervals in intervals_by_anesthetist.values():
         model.AddNoOverlap(intervals)
 
-    # ---------------------------------------------------------
-    # Objective
-    # ---------------------------------------------------------
+    # Capacity permits as many simultaneous users as there
+    # are physical units of each equipment type.
+    for equipment_type, intervals in intervals_by_equipment_type.items():
+        model.AddCumulative(
+            intervals,
+            [1] * len(intervals),
+            equipment_capacity[equipment_type],
+        )
 
+    # Objective: prioritize surgeries and prefer earlier starts.
     objective_terms = []
 
     for surgery in surgeries:
-
         surgery_id = surgery.id
         scheduled = scheduled_vars[surgery_id]
 
-        priority_weight = PRIORITY_WEIGHT.get(
-            surgery.priority,
-            100
-        )
+        weight = PRIORITY_WEIGHT.get(surgery.priority, 100)
+        objective_terms.append(weight * scheduled)
 
-        # Reward scheduling higher-priority surgeries.
-        objective_terms.append(
-            priority_weight * scheduled
-        )
-
-        # Prefer earlier start times.
         early_start = model.NewIntVar(
-            0,
-            horizon,
-            f"early_start_{surgery_id}"
+            0, horizon, f"early_start_{surgery_id}"
         )
 
         model.Add(
@@ -209,78 +161,45 @@ def optimize_schedule(surgeries, operating_rooms):
             early_start == horizon
         ).OnlyEnforceIf(scheduled.Not())
 
-        objective_terms.append(
-            horizon - early_start
-        )
+        objective_terms.append(horizon - early_start)
 
-    model.Maximize(
-        sum(objective_terms)
-    )
+    model.Maximize(sum(objective_terms))
 
-    # ---------------------------------------------------------
-    # Solve
-    # ---------------------------------------------------------
-
+    # Solve the model.
     solver = cp_model.CpSolver()
-
     solver.parameters.max_time_in_seconds = 10
     solver.parameters.num_search_workers = 8
-
     status = solver.Solve(model)
 
-    # ---------------------------------------------------------
-    # Build result
-    # ---------------------------------------------------------
-
+    # Build the result.
     schedule = []
     unscheduled_surgeries = []
 
-    if status in (
-        cp_model.OPTIMAL,
-        cp_model.FEASIBLE,
-    ):
-
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         for surgery in surgeries:
-
             surgery_id = surgery.id
 
-            if not solver.Value(
-                scheduled_vars[surgery_id]
-            ):
-                unscheduled_surgeries.append(
-                    surgery_id
-                )
+            if not solver.Value(scheduled_vars[surgery_id]):
+                unscheduled_surgeries.append(surgery_id)
                 continue
 
             assigned_room = None
 
-            for room_index, room in enumerate(
-                operating_rooms
-            ):
-
+            for room_index, room in enumerate(operating_rooms):
                 assignment = room_assignment_vars.get(
                     (surgery_id, room_index)
                 )
 
-                if assignment is not None:
-
-                    if solver.Value(assignment):
-                        assigned_room = room
-                        break
+                if assignment is not None and solver.Value(assignment):
+                    assigned_room = room
+                    break
 
             if assigned_room is None:
-                unscheduled_surgeries.append(
-                    surgery_id
-                )
+                unscheduled_surgeries.append(surgery_id)
                 continue
 
-            start = solver.Value(
-                start_vars[surgery_id]
-            )
-
-            end = solver.Value(
-                end_vars[surgery_id]
-            )
+            start = solver.Value(start_vars[surgery_id])
+            end = solver.Value(end_vars[surgery_id])
 
             schedule.append({
                 "surgery_id": surgery.id,
@@ -293,13 +212,13 @@ def optimize_schedule(surgeries, operating_rooms):
                 "start": start,
                 "end": end,
                 "duration": surgery.duration,
+                "required_equipment": list(
+                    surgery.required_equipment
+                ),
             })
-
     else:
-
         unscheduled_surgeries = [
-            surgery.id
-            for surgery in surgeries
+            surgery.id for surgery in surgeries
         ]
 
     return {
