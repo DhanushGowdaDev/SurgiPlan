@@ -16,8 +16,7 @@ import {
 } from "lucide-react";
 import "./App.css";
 
-const API = "http://127.0.0.1:8000";
-
+const API = "https://surgiplan.onrender.com";
 type Surgery = {
   id: string;
   procedure: string;
